@@ -39,6 +39,8 @@ DB_PATH = os.getenv("AINS_DB_PATH", "notes.db")
 CHROMA_PATH = os.getenv("AINS_CHROMA_PATH", "data/chroma")
 EMB_NAME = os.getenv("AINS_EMB_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 TOP_K = int(os.getenv("AINS_TOP_K", "5"))
+DB_PATH = os.getenv("AINS_DB_PATH", "notes.db")
+DEFAULT_TOP_K = 5
 
 os.makedirs("data", exist_ok=True)
 
@@ -58,6 +60,16 @@ def _init_db():
         )
         """)
         con.commit()
+
+
+def get_db():
+    """
+    Return a SQLite3 connection with row_factory set to sqlite3.Row
+    so you can access columns as dict keys.
+    """
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
 
 def insert_note(title: str, tags: str, content: str) -> int:
     now = datetime.utcnow().isoformat(timespec="seconds")
@@ -92,6 +104,7 @@ def keyword_search_df(q: str) -> pd.DataFrame:
             "SELECT * FROM notes WHERE title LIKE ? OR tags LIKE ? OR content LIKE ? ORDER BY updated_at DESC",
             con, params=(like, like, like))
     return df
+
 
 # -----------------------------
 # Embeddings + Chroma helpers
@@ -349,12 +362,21 @@ def rich_editor(key: str, initial_html: str = "") -> str:
     st.session_state[state_key] = html_value or st.session_state[state_key]
     return st.session_state[state_key]
 
+def fetch_note_by_id(note_id: int):
+    """Return one note row (dict-like) with full HTML content."""
+    con = get_db()
+    row = con.execute(
+        "SELECT id, title, tags, content, updated_at FROM notes WHERE id=?",
+        (note_id,)
+    ).fetchone()
+    return row
+
 
 # -----------------------------
 # UI
 # -----------------------------
 st.set_page_config(page_title="Note Assistant", page_icon="✍️", layout="wide")
-st.title("AI Note Assistant")
+st.title("Note Assistant")
 st.caption("Semantic notes • Keyword search • RAG Q&A • CSV/JSON import/export  |  Local by default, LLM optional")
 
 with st.sidebar:
@@ -522,30 +544,122 @@ with tab_new:
 
 
 # -----------------------------
-# Search tab
+# Search tab  (preview above results)
 # -----------------------------
 with tab_search:
     st.subheader("Search Notes")
-    q = st.text_input("Query", placeholder="e.g., gradient descent vs. newton, or 'invoice tax 2024'")
-    cols = st.columns(3)
-    do_kw = cols[0].checkbox("Keyword", value=True)
-    do_sem = cols[1].checkbox("Semantic", value=True)
-    k = cols[2].slider("Top-K (semantic)", 1, 15, TOP_K)
+    q = st.text_input("Query", placeholder="e.g., gradient descent; invoice tax 2024; meeting notes")
 
+    c1, c2, c3 = st.columns(3)
+    use_keyword = c1.checkbox("Keyword", value=True)
+    use_semantic = c2.checkbox("Semantic", value=True)
+    k = c3.slider("Top-K (semantic)", 1, 15, DEFAULT_TOP_K)
+
+    # State for preview
+    st.session_state.setdefault("preview_note_id", None)
+    st.session_state.setdefault("preview_note_title", "")
+    st.session_state.setdefault("preview_note_meta", "")
+    st.session_state.setdefault("preview_note_html", "")
+
+    # Run search
     if st.button("Search"):
         if not q.strip():
             st.warning("Enter a query.")
         else:
-            if do_kw:
-                df_kw = keyword_search_df(q.strip())
-                st.write("**Keyword matches**")
-                st.dataframe(df_kw, use_container_width=True, hide_index=True)
-            if do_sem:
-                res = semantic_search(q.strip(), k)
-                st.write("**Semantic matches**")
+            st.session_state["search_started"] = True
+            st.session_state["search_query"] = q.strip()
+
+    # PREVIEW FIRST (always on top)
+    st.markdown("### Preview")
+    if st.session_state.get("preview_note_id") is None:
+        st.caption("Select a result below to preview its full content.")
+    else:
+        st.markdown(f"**{st.session_state.get('preview_note_title','')}**")
+        st.caption(st.session_state.get("preview_note_meta",""))
+        st.markdown(st.session_state.get("preview_note_html",""), unsafe_allow_html=True)
+
+    st.divider()
+
+    # RESULTS BELOW PREVIEW
+    if st.session_state.get("search_started"):
+        q_run = st.session_state.get("search_query", "")
+
+        # Keyword matches
+        if use_keyword:
+            st.markdown("### Keyword matches")
+            try:
+                df_kw = keyword_search_df(q_run)
+            except Exception as e:
+                st.error(f"Keyword search failed: {e}")
+                df_kw = None
+
+            if df_kw is not None and not df_kw.empty:
+                for _, r in df_kw.iterrows():
+                    nid = int(r["id"])
+                    title = r["title"]
+                    meta = f"#{nid} • {(r.get('tags','') or '')} • {r['updated_at']}"
+                    row_c1, row_c2 = st.columns([6, 1])
+                    with row_c1:
+                        st.caption(meta)
+                        if st.button(title, key=f"kw_title_{nid}"):
+                            note = fetch_note_by_id(nid)
+                            if note:
+                                st.session_state["preview_note_id"] = nid
+                                st.session_state["preview_note_title"] = note["title"]
+                                st.session_state["preview_note_meta"] = f"Tags: {note['tags'] or ''} • Updated: {note['updated_at']}"
+                                st.session_state["preview_note_html"] = note["content"] or ""
+                                st.rerun()
+                    with row_c2:
+                        if st.button("Preview", key=f"kw_prev_{nid}"):
+                            note = fetch_note_by_id(nid)
+                            if note:
+                                st.session_state["preview_note_id"] = nid
+                                st.session_state["preview_note_title"] = note["title"]
+                                st.session_state["preview_note_meta"] = f"Tags: {note['tags'] or ''} • Updated: {note['updated_at']}"
+                                st.session_state["preview_note_html"] = note["content"] or ""
+                                st.rerun()
+            else:
+                st.caption("No keyword matches.")
+
+            st.divider()
+
+        # Semantic matches
+        if use_semantic:
+            st.markdown("### Semantic matches")
+            try:
+                res = semantic_search(q_run, k)
+            except Exception as e:
+                st.error(f"Semantic search failed: {e}")
+                res = []
+
+            if res:
                 for r in res:
-                    with st.expander(f"#{r['id']}  {r['title']}  —  {r['tags']}  (dist={r['distance']:.3f})", expanded=False):
-                        st.markdown(r["document"])
+                    nid = int(r["id"])
+                    title = r["title"] or f"Note {nid}"
+                    meta = f"#{nid} • {(r.get('tags','') or '')} • dist={r['distance']:.3f}"
+                    row_c1, row_c2 = st.columns([6, 1])
+                    with row_c1:
+                        st.caption(meta)
+                        if st.button(title, key=f"sem_title_{nid}"):
+                            note = fetch_note_by_id(nid)
+                            if note:
+                                st.session_state["preview_note_id"] = nid
+                                st.session_state["preview_note_title"] = note["title"]
+                                st.session_state["preview_note_meta"] = f"Tags: {note['tags'] or ''} • Updated: {note['updated_at']}"
+                                st.session_state["preview_note_html"] = note["content"] or ""
+                                st.rerun()
+                    with row_c2:
+                        if st.button("Preview", key=f"sem_prev_{nid}"):
+                            note = fetch_note_by_id(nid)
+                            if note:
+                                st.session_state["preview_note_id"] = nid
+                                st.session_state["preview_note_title"] = note["title"]
+                                st.session_state["preview_note_meta"] = f"Tags: {note['tags'] or ''} • Updated: {note['updated_at']}"
+                                st.session_state["preview_note_html"] = note["content"] or ""
+                                st.rerun()
+            else:
+                st.caption("No semantic matches.")
+
 
 # -----------------------------
 # Q&A tab
